@@ -11,6 +11,12 @@
 #include <linux/inet.h>
 #include <linux/in.h>
 #include <linux/string.h>
+#include <linux/ip.h>
+#include <linux/icmp.h>
+#include <linux/skbuff.h>
+#include <linux/rtnetlink.h>
+#include <linux/kmod.h>
+#include <net/ip.h>
 
 #define VNETIF_LIST_PROC_NAME  "vnetif"
 #define VNETIF_ADD_PROC_NAME   "vnetif_add"
@@ -19,6 +25,7 @@
 
 #define VNETIF_CMD_BUF_SZ   64
 #define VNETIF_READ_BUF_SZ  1024
+#define VNETIF_CIDR_SUFFIX  "/24"
 
 struct vnetif_priv {
     int if_id;
@@ -48,8 +55,22 @@ static void vnet_setup(struct net_device *dev);
 static struct vnetif_dev *vnetif_find_locked(const char *name);
 static int vnetif_create_locked(void);
 static int vnetif_destroy_one_locked(const char *name);
-static int vnetif_set_ipv4_locked(const char *name, const char *ip_str);
+static int vnetif_set_ipv4_locked(const char *name, const char *ip_str,
+                                  char *ifname_out, size_t ifname_out_len);
 static void vnetif_destroy_all_locked(void);
+static int vnetif_set_link_up(struct net_device *dev);
+
+static bool vnetif_should_reply_icmp_echo(struct sk_buff *skb,
+                                          struct net_device *dev);
+static void vnetif_update_icmp_checksum(struct icmphdr *icmph, size_t len);
+static void vnetif_update_ip_checksum(struct iphdr *iph);
+static int vnetif_build_icmp_echo_reply(struct sk_buff *skb,
+                                        struct net_device *dev);
+static netdev_tx_t vnetif_rx_reply(struct sk_buff *skb,
+                                   struct net_device *dev);
+
+static int vnetif_run_cmd(char *const argv[]);
+static int vnetif_apply_ipv4_userspace(const char *ifname, const char *ip_str);
 
 static ssize_t vnetif_list_read(struct file *file, char __user *buffer,
                                 size_t count, loff_t *ppos);
@@ -90,11 +111,179 @@ static int vnet_stop(struct net_device *dev)
     return 0;
 }
 
+static bool vnetif_should_reply_icmp_echo(struct sk_buff *skb,
+                                          struct net_device *dev)
+{
+    struct vnetif_priv *priv;
+    struct ethhdr *eth;
+    struct iphdr *iph;
+    struct icmphdr *icmph;
+
+    if (!skb)
+        return false;
+
+    if (skb->len < sizeof(struct ethhdr) + sizeof(struct iphdr))
+        return false;
+
+    if (!pskb_may_pull(skb, sizeof(struct ethhdr) + sizeof(struct iphdr)))
+        return false;
+
+    eth = eth_hdr(skb);
+    if (!eth)
+        return false;
+
+    if (eth->h_proto != htons(ETH_P_IP))
+        return false;
+
+    iph = ip_hdr(skb);
+    if (!iph)
+        return false;
+
+    if (iph->version != 4)
+        return false;
+
+    if (iph->ihl < 5)
+        return false;
+
+    if (iph->protocol != IPPROTO_ICMP)
+        return false;
+
+    if (!pskb_may_pull(skb, sizeof(struct ethhdr) +
+                            (iph->ihl * 4) +
+                            sizeof(struct icmphdr)))
+        return false;
+
+    iph = ip_hdr(skb);
+    icmph = (struct icmphdr *)((u8 *)iph + (iph->ihl * 4));
+    if (!icmph)
+        return false;
+
+    if (icmph->type != ICMP_ECHO)
+        return false;
+
+    priv = netdev_priv(dev);
+    if (!priv->ipv4_addr)
+        return false;
+
+    if (iph->daddr != priv->ipv4_addr)
+        return false;
+
+    return true;
+}
+
+static void vnetif_update_icmp_checksum(struct icmphdr *icmph, size_t len)
+{
+    icmph->checksum = 0;
+    icmph->checksum = ip_compute_csum((void *)icmph, len);
+}
+
+static void vnetif_update_ip_checksum(struct iphdr *iph)
+{
+    iph->check = 0;
+    ip_send_check(iph);
+}
+
+static int vnetif_build_icmp_echo_reply(struct sk_buff *skb,
+                                        struct net_device *dev)
+{
+    struct ethhdr *eth;
+    struct iphdr *iph;
+    struct icmphdr *icmph;
+    struct vnetif_priv *priv;
+    __be32 tmp_ip;
+    size_t ip_hdr_len;
+    size_t icmp_len;
+
+    skb_reset_mac_header(skb);
+    skb_set_network_header(skb, sizeof(struct ethhdr));
+
+    eth = eth_hdr(skb);
+    if (!eth)
+        return -EINVAL;
+
+    iph = ip_hdr(skb);
+    if (!iph)
+        return -EINVAL;
+
+    ip_hdr_len = iph->ihl * 4;
+    if (skb->len < sizeof(struct ethhdr) + ip_hdr_len + sizeof(struct icmphdr))
+        return -EINVAL;
+
+    icmph = (struct icmphdr *)((u8 *)iph + ip_hdr_len);
+    if (!icmph)
+        return -EINVAL;
+
+    priv = netdev_priv(dev);
+
+    memcpy(eth->h_source, dev->dev_addr, ETH_ALEN);
+    memcpy(eth->h_dest, dev->dev_addr, ETH_ALEN);
+
+    tmp_ip = iph->saddr;
+    iph->saddr = priv->ipv4_addr;
+    iph->daddr = tmp_ip;
+    iph->ttl = 64;
+
+    icmph->type = ICMP_ECHOREPLY;
+    icmph->code = 0;
+
+    icmp_len = ntohs(iph->tot_len) - ip_hdr_len;
+
+    vnetif_update_icmp_checksum(icmph, icmp_len);
+    vnetif_update_ip_checksum(iph);
+
+    return 0;
+}
+
+static netdev_tx_t vnetif_rx_reply(struct sk_buff *skb,
+                                   struct net_device *dev)
+{
+    skb->dev = dev;
+    skb->ip_summed = CHECKSUM_NONE;
+    skb->protocol = eth_type_trans(skb, dev);
+    skb->pkt_type = PACKET_HOST;
+
+    netif_rx(skb);
+    return NETDEV_TX_OK;
+}
+
 static netdev_tx_t vnet_xmit(struct sk_buff *skb, struct net_device *dev)
 {
-    dev_kfree_skb(skb);
-    dev->stats.tx_dropped++;
-    return NETDEV_TX_OK;
+    int ret;
+
+    if (!skb) {
+        dev->stats.tx_dropped++;
+        return NETDEV_TX_OK;
+    }
+
+    skb_reset_mac_header(skb);
+    skb_set_network_header(skb, sizeof(struct ethhdr));
+
+    pr_info("vnetif: xmit on %s, len=%u\n", dev->name, skb->len);
+
+    if (!vnetif_should_reply_icmp_echo(skb, dev)) {
+        pr_info("vnetif: packet ignored on %s\n", dev->name);
+        dev_kfree_skb(skb);
+        dev->stats.tx_dropped++;
+        return NETDEV_TX_OK;
+    }
+
+    pr_info("vnetif: ICMP echo request matched on %s\n", dev->name);
+
+    ret = vnetif_build_icmp_echo_reply(skb, dev);
+    if (ret) {
+        pr_info("vnetif: failed to build ICMP echo reply on %s, ret=%d\n",
+                dev->name, ret);
+        dev_kfree_skb(skb);
+        dev->stats.tx_dropped++;
+        return NETDEV_TX_OK;
+    }
+
+    dev->stats.tx_packets++;
+    dev->stats.tx_bytes += skb->len;
+    dev->stats.rx_packets++;
+    dev->stats.rx_bytes += skb->len;
+
+    return vnetif_rx_reply(skb, dev);
 }
 
 static const struct net_device_ops vnet_netdev_ops = {
@@ -109,6 +298,7 @@ static void vnet_setup(struct net_device *dev)
     dev->netdev_ops = &vnet_netdev_ops;
     dev->flags |= IFF_NOARP;
     eth_hw_addr_random(dev);
+    netif_carrier_on(dev);
 }
 
 static struct vnetif_dev *vnetif_find_locked(const char *name)
@@ -121,6 +311,99 @@ static struct vnetif_dev *vnetif_find_locked(const char *name)
     }
 
     return NULL;
+}
+
+static int vnetif_set_link_up(struct net_device *dev)
+{
+    int ret;
+
+    rtnl_lock();
+    ret = dev_open(dev, NULL);
+    rtnl_unlock();
+
+    if (ret)
+        pr_err("vnetif: failed to bring %s up: %d\n", dev->name, ret);
+    else
+        pr_info("vnetif: %s brought up automatically\n", dev->name);
+
+    return ret;
+}
+
+static int vnetif_run_cmd(char *const argv[])
+{
+    static char *envp[] = {
+        "HOME=/",
+        "TERM=linux",
+        "PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+        NULL
+    };
+
+    return call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
+}
+
+static int vnetif_apply_ipv4_userspace(const char *ifname, const char *ip_str)
+{
+    char addr_cidr[48];
+    char *argv_addr[] = {
+        "/usr/sbin/ip",
+        "addr",
+        "replace",
+        addr_cidr,
+        "dev",
+        (char *)ifname,
+        NULL
+    };
+    char *argv_addr_fallback[] = {
+        "/sbin/ip",
+        "addr",
+        "replace",
+        addr_cidr,
+        "dev",
+        (char *)ifname,
+        NULL
+    };
+    char *argv_link[] = {
+        "/usr/sbin/ip",
+        "link",
+        "set",
+        "dev",
+        (char *)ifname,
+        "up",
+        NULL
+    };
+    char *argv_link_fallback[] = {
+        "/sbin/ip",
+        "link",
+        "set",
+        "dev",
+        (char *)ifname,
+        "up",
+        NULL
+    };
+    int ret;
+
+    snprintf(addr_cidr, sizeof(addr_cidr), "%s%s", ip_str, VNETIF_CIDR_SUFFIX);
+
+    ret = vnetif_run_cmd(argv_addr);
+    if (ret)
+        ret = vnetif_run_cmd(argv_addr_fallback);
+    if (ret) {
+        pr_err("vnetif: failed to configure IPv4 on %s, ret=%d\n",
+               ifname, ret);
+        return ret;
+    }
+
+    ret = vnetif_run_cmd(argv_link);
+    if (ret)
+        ret = vnetif_run_cmd(argv_link_fallback);
+    if (ret) {
+        pr_err("vnetif: failed to set %s up via ip tool, ret=%d\n",
+               ifname, ret);
+        return ret;
+    }
+
+    pr_info("vnetif: configured %s with IPv4 %s\n", ifname, addr_cidr);
+    return 0;
 }
 
 static int vnetif_create_locked(void)
@@ -143,6 +426,13 @@ static int vnetif_create_locked(void)
 
     ret = register_netdev(dev);
     if (ret) {
+        free_netdev(dev);
+        return ret;
+    }
+
+    ret = vnetif_set_link_up(dev);
+    if (ret) {
+        unregister_netdev(dev);
         free_netdev(dev);
         return ret;
     }
@@ -178,7 +468,8 @@ static int vnetif_destroy_one_locked(const char *name)
     return 0;
 }
 
-static int vnetif_set_ipv4_locked(const char *name, const char *ip_str)
+static int vnetif_set_ipv4_locked(const char *name, const char *ip_str,
+                                  char *ifname_out, size_t ifname_out_len)
 {
     struct vnetif_dev *entry;
     struct vnetif_priv *priv;
@@ -193,6 +484,8 @@ static int vnetif_set_ipv4_locked(const char *name, const char *ip_str)
 
     priv = netdev_priv(entry->netdev);
     priv->ipv4_addr = addr;
+
+    strscpy(ifname_out, entry->netdev->name, ifname_out_len);
 
     pr_info("vnetif: %s ipv4 set to %pI4\n", name, &priv->ipv4_addr);
     return 0;
@@ -326,9 +619,12 @@ static ssize_t vnetif_ipv4_write(struct file *file, const char __user *buffer,
         return -EINVAL;
 
     mutex_lock(&vnetif_lock);
-    ret = vnetif_set_ipv4_locked(ifname, ip_str);
+    ret = vnetif_set_ipv4_locked(ifname, ip_str, ifname, sizeof(ifname));
     mutex_unlock(&vnetif_lock);
+    if (ret)
+        return ret;
 
+    ret = vnetif_apply_ipv4_userspace(ifname, ip_str);
     if (ret)
         return ret;
 
@@ -382,7 +678,7 @@ err_remove_add:
 err_remove_list:
     proc_remove(proc_list_entry);
     proc_list_entry = NULL;
-    return -ENOMEM;
+    return ret;
 }
 
 static void __exit vnetif_exit(void)
@@ -419,5 +715,5 @@ module_exit(vnetif_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Arayik Gharibyan");
-MODULE_DESCRIPTION("Virtual network interface kernel module with procfs control");
+MODULE_DESCRIPTION("Virtual network interface kernel module with procfs control and basic ICMP echo handling");
 MODULE_VERSION("1.0");

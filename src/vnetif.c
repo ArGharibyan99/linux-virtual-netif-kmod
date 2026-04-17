@@ -16,6 +16,7 @@
 #include <linux/skbuff.h>
 #include <linux/rtnetlink.h>
 #include <linux/kmod.h>
+#include <linux/if_arp.h>
 #include <net/ip.h>
 
 #define VNETIF_LIST_PROC_NAME  "vnetif"
@@ -37,6 +38,13 @@ struct vnetif_dev {
     struct list_head list;
 };
 
+struct vnetif_arp_eth_ipv4 {
+    unsigned char sha[ETH_ALEN];
+    __be32 sip;
+    unsigned char tha[ETH_ALEN];
+    __be32 tip;
+} __packed;
+
 static LIST_HEAD(vnetif_list);
 static DEFINE_MUTEX(vnetif_lock);
 
@@ -55,21 +63,30 @@ static void vnet_setup(struct net_device *dev);
 static struct vnetif_dev *vnetif_find_locked(const char *name);
 static int vnetif_create_locked(void);
 static int vnetif_destroy_one_locked(const char *name);
-static int vnetif_set_ipv4_locked(const char *name, const char *ip_str,
-                                  char *ifname_out, size_t ifname_out_len);
+static int vnetif_validate_ipv4_locked(const char *name, const char *ip_str,
+                                       char *ifname_out,
+                                       size_t ifname_out_len);
+static int vnetif_set_ipv4_locked(const char *name, const char *ip_str);
 static void vnetif_destroy_all_locked(void);
 static int vnetif_set_link_up(struct net_device *dev);
 
 static bool vnetif_should_reply_icmp_echo(struct sk_buff *skb,
                                           struct net_device *dev);
+static bool vnetif_should_reply_arp(struct sk_buff *skb,
+                                    struct net_device *dev);
+
 static void vnetif_update_icmp_checksum(struct icmphdr *icmph, size_t len);
 static void vnetif_update_ip_checksum(struct iphdr *iph);
+
 static int vnetif_build_icmp_echo_reply(struct sk_buff *skb,
                                         struct net_device *dev);
-static netdev_tx_t vnetif_rx_reply(struct sk_buff *skb,
-                                   struct net_device *dev);
+static int vnetif_build_arp_reply(struct sk_buff *skb,
+                                  struct net_device *dev);
 
-static int vnetif_run_cmd(char *const argv[]);
+static netdev_tx_t vnetif_rx_reply_local(struct sk_buff *skb,
+                                         struct net_device *dev);
+
+static int vnetif_run_cmd(char **argv);
 static int vnetif_apply_ipv4_userspace(const char *ifname, const char *ip_str);
 
 static ssize_t vnetif_list_read(struct file *file, char __user *buffer,
@@ -100,15 +117,74 @@ static const struct proc_ops vnetif_ipv4_proc_ops = {
 static int vnet_open(struct net_device *dev)
 {
     netif_start_queue(dev);
-    pr_info("%s: interface opened\n", dev->name);
+    pr_info("vnetif: %s up\n", dev->name);
     return 0;
 }
 
 static int vnet_stop(struct net_device *dev)
 {
     netif_stop_queue(dev);
-    pr_info("%s: interface stopped\n", dev->name);
+    pr_info("vnetif: %s down\n", dev->name);
     return 0;
+}
+
+static bool vnetif_should_reply_arp(struct sk_buff *skb,
+                                    struct net_device *dev)
+{
+    struct vnetif_priv *priv;
+    struct ethhdr *eth;
+    struct arphdr *arp;
+    struct vnetif_arp_eth_ipv4 *arp_data;
+
+    if (!skb)
+        return false;
+
+    if (skb->len < sizeof(struct ethhdr) +
+                   sizeof(struct arphdr) +
+                   sizeof(struct vnetif_arp_eth_ipv4))
+        return false;
+
+    if (!pskb_may_pull(skb, sizeof(struct ethhdr) +
+                            sizeof(struct arphdr) +
+                            sizeof(struct vnetif_arp_eth_ipv4)))
+        return false;
+
+    skb_reset_mac_header(skb);
+    skb_set_network_header(skb, sizeof(struct ethhdr));
+
+    eth = eth_hdr(skb);
+    if (!eth)
+        return false;
+
+    if (eth->h_proto != htons(ETH_P_ARP))
+        return false;
+
+    arp = (struct arphdr *)skb_network_header(skb);
+    if (!arp)
+        return false;
+
+    if (arp->ar_hrd != htons(ARPHRD_ETHER))
+        return false;
+
+    if (arp->ar_pro != htons(ETH_P_IP))
+        return false;
+
+    if (arp->ar_hln != ETH_ALEN)
+        return false;
+
+    if (arp->ar_pln != 4)
+        return false;
+
+    if (arp->ar_op != htons(ARPOP_REQUEST))
+        return false;
+
+    arp_data = (struct vnetif_arp_eth_ipv4 *)(arp + 1);
+
+    priv = netdev_priv(dev);
+    if (!priv->ipv4_addr)
+        return false;
+
+    return arp_data->tip == priv->ipv4_addr;
 }
 
 static bool vnetif_should_reply_icmp_echo(struct sk_buff *skb,
@@ -122,11 +198,11 @@ static bool vnetif_should_reply_icmp_echo(struct sk_buff *skb,
     if (!skb)
         return false;
 
-    if (skb->len < sizeof(struct ethhdr) + sizeof(struct iphdr))
-        return false;
-
     if (!pskb_may_pull(skb, sizeof(struct ethhdr) + sizeof(struct iphdr)))
         return false;
+
+    skb_reset_mac_header(skb);
+    skb_set_network_header(skb, sizeof(struct ethhdr));
 
     eth = eth_hdr(skb);
     if (!eth)
@@ -135,26 +211,23 @@ static bool vnetif_should_reply_icmp_echo(struct sk_buff *skb,
     if (eth->h_proto != htons(ETH_P_IP))
         return false;
 
-    iph = ip_hdr(skb);
+    iph = (struct iphdr *)skb_network_header(skb);
     if (!iph)
         return false;
 
-    if (iph->version != 4)
-        return false;
-
-    if (iph->ihl < 5)
+    if (iph->version != 4 || iph->ihl < 5)
         return false;
 
     if (iph->protocol != IPPROTO_ICMP)
         return false;
 
     if (!pskb_may_pull(skb, sizeof(struct ethhdr) +
-                            (iph->ihl * 4) +
+                            iph->ihl * 4 +
                             sizeof(struct icmphdr)))
         return false;
 
-    iph = ip_hdr(skb);
-    icmph = (struct icmphdr *)((u8 *)iph + (iph->ihl * 4));
+    iph = (struct iphdr *)skb_network_header(skb);
+    icmph = (struct icmphdr *)((u8 *)iph + iph->ihl * 4);
     if (!icmph)
         return false;
 
@@ -165,10 +238,7 @@ static bool vnetif_should_reply_icmp_echo(struct sk_buff *skb,
     if (!priv->ipv4_addr)
         return false;
 
-    if (iph->daddr != priv->ipv4_addr)
-        return false;
-
-    return true;
+    return iph->daddr == priv->ipv4_addr;
 }
 
 static void vnetif_update_icmp_checksum(struct icmphdr *icmph, size_t len)
@@ -201,7 +271,7 @@ static int vnetif_build_icmp_echo_reply(struct sk_buff *skb,
     if (!eth)
         return -EINVAL;
 
-    iph = ip_hdr(skb);
+    iph = (struct iphdr *)skb_network_header(skb);
     if (!iph)
         return -EINVAL;
 
@@ -215,8 +285,9 @@ static int vnetif_build_icmp_echo_reply(struct sk_buff *skb,
 
     priv = netdev_priv(dev);
 
+    /* Reply goes back to whoever sent the request. */
+    memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
     memcpy(eth->h_source, dev->dev_addr, ETH_ALEN);
-    memcpy(eth->h_dest, dev->dev_addr, ETH_ALEN);
 
     tmp_ip = iph->saddr;
     iph->saddr = priv->ipv4_addr;
@@ -234,20 +305,97 @@ static int vnetif_build_icmp_echo_reply(struct sk_buff *skb,
     return 0;
 }
 
-static netdev_tx_t vnetif_rx_reply(struct sk_buff *skb,
-                                   struct net_device *dev)
+static int vnetif_build_arp_reply(struct sk_buff *skb,
+                                  struct net_device *dev)
 {
+    struct ethhdr *eth;
+    struct arphdr *arp;
+    struct vnetif_arp_eth_ipv4 *arp_data;
+    struct vnetif_priv *priv;
+    unsigned char requester_mac[ETH_ALEN];
+    __be32 requester_ip;
+
+    skb_reset_mac_header(skb);
+    skb_set_network_header(skb, sizeof(struct ethhdr));
+
+    if (skb->len < sizeof(struct ethhdr) +
+                   sizeof(struct arphdr) +
+                   sizeof(struct vnetif_arp_eth_ipv4))
+        return -EINVAL;
+
+    eth = eth_hdr(skb);
+    if (!eth)
+        return -EINVAL;
+
+    arp = (struct arphdr *)skb_network_header(skb);
+    if (!arp)
+        return -EINVAL;
+
+    arp_data = (struct vnetif_arp_eth_ipv4 *)(arp + 1);
+    if (!arp_data)
+        return -EINVAL;
+
+    priv = netdev_priv(dev);
+
+    memcpy(requester_mac, arp_data->sha, ETH_ALEN);
+    requester_ip = arp_data->sip;
+
+    memcpy(eth->h_dest, requester_mac, ETH_ALEN);
+    memcpy(eth->h_source, dev->dev_addr, ETH_ALEN);
+    eth->h_proto = htons(ETH_P_ARP);
+
+    arp->ar_op = htons(ARPOP_REPLY);
+
+    memcpy(arp_data->tha, requester_mac, ETH_ALEN);
+    arp_data->tip = requester_ip;
+
+    memcpy(arp_data->sha, dev->dev_addr, ETH_ALEN);
+    arp_data->sip = priv->ipv4_addr;
+
+    return 0;
+}
+
+static netdev_tx_t vnetif_rx_reply_local(struct sk_buff *skb,
+                                         struct net_device *dev)
+{
+    struct ethhdr *eth = eth_hdr(skb);
+
+    /*
+     * If the reply is destined for our own MAC it is a local self-ping.
+     * Deliver it directly via netif_rx so the host's IP stack receives it,
+     * regardless of whether vnet0 happens to be a bridge slave.  Routing
+     * through the bridge for a self-addressed frame would cause it to be
+     * dropped (bridge does not loop frames back to itself on the xmit path).
+     */
+    if (ether_addr_equal(eth->h_dest, dev->dev_addr)) {
+        /* Self-ping: deliver directly to the local IP stack. */
+        skb->dev = dev;
+        skb->ip_summed = CHECKSUM_NONE;
+        skb->protocol = eth_type_trans(skb, dev);
+        skb->pkt_type = PACKET_HOST;
+        netif_rx(skb);
+        return NETDEV_TX_OK;
+    }
+
+    /*
+     * Remote reply: inject via netif_rx(vnet0) so the bridge RX path
+     * learns vnet0's MAC on port vnet0 in its FDB.  Requires the bridge's
+     * LOCAL FDB entry for vnet0's MAC to have been removed first
+     * (the test script does this with "bridge fdb del <mac> dev vnet0 master").
+     */
     skb->dev = dev;
     skb->ip_summed = CHECKSUM_NONE;
     skb->protocol = eth_type_trans(skb, dev);
-    skb->pkt_type = PACKET_HOST;
-
     netif_rx(skb);
+
     return NETDEV_TX_OK;
 }
 
 static netdev_tx_t vnet_xmit(struct sk_buff *skb, struct net_device *dev)
 {
+    struct ethhdr *eth;
+    struct net_device *master;
+    int xmit_ret;
     int ret;
 
     if (!skb) {
@@ -257,33 +405,79 @@ static netdev_tx_t vnet_xmit(struct sk_buff *skb, struct net_device *dev)
 
     skb_reset_mac_header(skb);
     skb_set_network_header(skb, sizeof(struct ethhdr));
+    eth = eth_hdr(skb);
 
-    pr_info("vnetif: xmit on %s, len=%u\n", dev->name, skb->len);
+    /*
+     * When we are a bridge slave, any non-self unicast frame queued for
+     * transmission should be handed to the bridge for normal forwarding.
+     * Relying on the source MAC being exactly dev->dev_addr is too strict:
+     * the host stack may emit replies after bridge/local delivery with a
+     * different L2 source context, and dropping those breaks remote ping.
+     * Self-addressed frames (standalone self-ping) still fall through to the
+     * custom handlers below.
+     */
+    if (!ether_addr_equal(eth->h_dest, dev->dev_addr) &&
+        !is_multicast_ether_addr(eth->h_dest)) {
+        rcu_read_lock();
+        master = netdev_master_upper_dev_get_rcu(dev);
+        if (master)
+            dev_hold(master);
+        rcu_read_unlock();
 
-    if (!vnetif_should_reply_icmp_echo(skb, dev)) {
-        pr_info("vnetif: packet ignored on %s\n", dev->name);
-        dev_kfree_skb(skb);
-        dev->stats.tx_dropped++;
-        return NETDEV_TX_OK;
+        if (master) {
+            dev->stats.tx_packets++;
+            dev->stats.tx_bytes += skb->len;
+            skb->dev = master;
+            skb->ip_summed = CHECKSUM_NONE;
+            skb->protocol = eth->h_proto;
+            xmit_ret = dev_queue_xmit(skb);
+            if (xmit_ret)
+                pr_err("vnetif: bridge xmit failed on %s: %d\n",
+                       dev->name, xmit_ret);
+            dev_put(master);
+            return NETDEV_TX_OK;
+        }
     }
 
-    pr_info("vnetif: ICMP echo request matched on %s\n", dev->name);
+    if (vnetif_should_reply_arp(skb, dev)) {
+        ret = vnetif_build_arp_reply(skb, dev);
+        if (ret) {
+            pr_info("vnetif: failed to build ARP reply on %s, ret=%d\n",
+                    dev->name, ret);
+            dev_kfree_skb(skb);
+            dev->stats.tx_dropped++;
+            return NETDEV_TX_OK;
+        }
 
-    ret = vnetif_build_icmp_echo_reply(skb, dev);
-    if (ret) {
-        pr_info("vnetif: failed to build ICMP echo reply on %s, ret=%d\n",
-                dev->name, ret);
-        dev_kfree_skb(skb);
-        dev->stats.tx_dropped++;
-        return NETDEV_TX_OK;
+        dev->stats.tx_packets++;
+        dev->stats.tx_bytes += skb->len;
+        dev->stats.rx_packets++;
+        dev->stats.rx_bytes += skb->len;
+
+        return vnetif_rx_reply_local(skb, dev);
     }
 
-    dev->stats.tx_packets++;
-    dev->stats.tx_bytes += skb->len;
-    dev->stats.rx_packets++;
-    dev->stats.rx_bytes += skb->len;
+    if (vnetif_should_reply_icmp_echo(skb, dev)) {
+        ret = vnetif_build_icmp_echo_reply(skb, dev);
+        if (ret) {
+            pr_info("vnetif: failed to build ICMP echo reply on %s, ret=%d\n",
+                    dev->name, ret);
+            dev_kfree_skb(skb);
+            dev->stats.tx_dropped++;
+            return NETDEV_TX_OK;
+        }
 
-    return vnetif_rx_reply(skb, dev);
+        dev->stats.tx_packets++;
+        dev->stats.tx_bytes += skb->len;
+        dev->stats.rx_packets++;
+        dev->stats.rx_bytes += skb->len;
+
+        return vnetif_rx_reply_local(skb, dev);
+    }
+
+    dev_kfree_skb(skb);
+    dev->stats.tx_dropped++;
+    return NETDEV_TX_OK;
 }
 
 static const struct net_device_ops vnet_netdev_ops = {
@@ -296,7 +490,6 @@ static void vnet_setup(struct net_device *dev)
 {
     ether_setup(dev);
     dev->netdev_ops = &vnet_netdev_ops;
-    dev->flags |= IFF_NOARP;
     eth_hw_addr_random(dev);
     netif_carrier_on(dev);
 }
@@ -329,7 +522,7 @@ static int vnetif_set_link_up(struct net_device *dev)
     return ret;
 }
 
-static int vnetif_run_cmd(char *const argv[])
+static int vnetif_run_cmd(char **argv)
 {
     static char *envp[] = {
         "HOME=/",
@@ -337,8 +530,17 @@ static int vnetif_run_cmd(char *const argv[])
         "PATH=/usr/sbin:/usr/bin:/sbin:/bin",
         NULL
     };
+    int ret;
 
-    return call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
+    ret = call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
+    if (ret == 0)
+        return 0;
+
+    if (ret < 0)
+        return ret;
+
+    pr_err("vnetif: command %s exited with wait status %d\n", argv[0], ret);
+    return -EINVAL;
 }
 
 static int vnetif_apply_ipv4_userspace(const char *ifname, const char *ip_str)
@@ -468,8 +670,25 @@ static int vnetif_destroy_one_locked(const char *name)
     return 0;
 }
 
-static int vnetif_set_ipv4_locked(const char *name, const char *ip_str,
-                                  char *ifname_out, size_t ifname_out_len)
+static int vnetif_validate_ipv4_locked(const char *name, const char *ip_str,
+                                       char *ifname_out,
+                                       size_t ifname_out_len)
+{
+    struct vnetif_dev *entry;
+    __be32 addr;
+
+    entry = vnetif_find_locked(name);
+    if (!entry)
+        return -ENOENT;
+
+    if (!in4_pton(ip_str, -1, (u8 *)&addr, -1, NULL))
+        return -EINVAL;
+
+    strscpy(ifname_out, entry->netdev->name, ifname_out_len);
+    return 0;
+}
+
+static int vnetif_set_ipv4_locked(const char *name, const char *ip_str)
 {
     struct vnetif_dev *entry;
     struct vnetif_priv *priv;
@@ -484,8 +703,6 @@ static int vnetif_set_ipv4_locked(const char *name, const char *ip_str,
 
     priv = netdev_priv(entry->netdev);
     priv->ipv4_addr = addr;
-
-    strscpy(ifname_out, entry->netdev->name, ifname_out_len);
 
     pr_info("vnetif: %s ipv4 set to %pI4\n", name, &priv->ipv4_addr);
     return 0;
@@ -619,12 +836,18 @@ static ssize_t vnetif_ipv4_write(struct file *file, const char __user *buffer,
         return -EINVAL;
 
     mutex_lock(&vnetif_lock);
-    ret = vnetif_set_ipv4_locked(ifname, ip_str, ifname, sizeof(ifname));
+    ret = vnetif_validate_ipv4_locked(ifname, ip_str, ifname, sizeof(ifname));
     mutex_unlock(&vnetif_lock);
     if (ret)
         return ret;
 
     ret = vnetif_apply_ipv4_userspace(ifname, ip_str);
+    if (ret)
+        return ret;
+
+    mutex_lock(&vnetif_lock);
+    ret = vnetif_set_ipv4_locked(ifname, ip_str);
+    mutex_unlock(&vnetif_lock);
     if (ret)
         return ret;
 
@@ -715,5 +938,5 @@ module_exit(vnetif_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Arayik Gharibyan");
-MODULE_DESCRIPTION("Virtual network interface kernel module with procfs control and basic ICMP echo handling");
+MODULE_DESCRIPTION("Virtual network interface kernel module with procfs control, local ICMP echo handling and basic ARP reply");
 MODULE_VERSION("1.0");
